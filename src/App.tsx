@@ -13,29 +13,26 @@ function mapRange(value: number, inMin: number, inMax: number, outMin: number, o
 }
 
 // ─── FRAME DECODER HOOK ───────────────────────────────────────────────────────
-// Uses the ImageDecoder API (Chrome/Edge 94+) to extract every frame of an
-// animated WebP into ImageBitmaps so we can render any frame on demand.
+// Decodes every frame of an animated WebP into ImageBitmaps for on-demand
+// rendering. Uses ArrayBuffer (more reliable than stream()) with ImageDecoder.
 
 interface FrameDecodeState {
   frames: ImageBitmap[];
-  loaded: boolean;
-  supported: boolean;
-  loadProgress: number;
+  scrubReady: boolean;   // true when >1 frame decoded — real scrubbing possible
+  loadProgress: number;  // 0-1
 }
 
 function useFrameDecoder(url: string): FrameDecodeState {
   const [state, setState] = useState<FrameDecodeState>({
     frames: [],
-    loaded: false,
-    supported: true,
+    scrubReady: false,
     loadProgress: 0,
   });
 
   useEffect(() => {
-    if (typeof (window as any).ImageDecoder === 'undefined') {
-      setState(s => ({ ...s, supported: false }));
-      return;
-    }
+    // ImageDecoder is Chrome/Edge 94+. On unsupported browsers we just skip;
+    // the animated <img> fallback is always visible beneath the canvas.
+    if (typeof (window as any).ImageDecoder === 'undefined') return;
 
     let cancelled = false;
     const bitmaps: ImageBitmap[] = [];
@@ -43,27 +40,33 @@ function useFrameDecoder(url: string): FrameDecodeState {
     async function decode() {
       try {
         const resp = await fetch(url);
-        const blob = await resp.blob();
+        // ArrayBuffer is more reliably supported than ReadableStream for ImageDecoder
+        const buffer = await resp.arrayBuffer();
 
         const decoder = new (window as any).ImageDecoder({
-          data: blob.stream(),
-          type: blob.type || 'image/webp',
+          data: buffer,
+          type: 'image/webp',
         });
 
         await decoder.tracks.ready;
         const track = decoder.tracks.selectedTrack;
         const total: number = track?.frameCount ?? 0;
+        console.log(`[FrameDecoder] frameCount=${total}`);
 
-        const limit = total > 0 ? total : 1000;
+        // If the file is static (1 frame or unknown), skip scrubbing
+        if (total <= 1) {
+          decoder.close();
+          return;
+        }
 
-        for (let i = 0; i < limit; i++) {
+        for (let i = 0; i < total; i++) {
           if (cancelled) break;
           try {
             const result = await decoder.decode({ frameIndex: i });
             const bmp = await createImageBitmap(result.image);
             result.image.close();
             bitmaps.push(bmp);
-            if (total > 0) setState(s => ({ ...s, loadProgress: (i + 1) / total }));
+            setState(s => ({ ...s, loadProgress: (i + 1) / total }));
           } catch {
             break;
           }
@@ -71,12 +74,13 @@ function useFrameDecoder(url: string): FrameDecodeState {
 
         decoder.close();
 
-        if (!cancelled) {
-          setState({ frames: bitmaps, loaded: true, supported: true, loadProgress: 1 });
+        if (!cancelled && bitmaps.length > 1) {
+          setState({ frames: bitmaps, scrubReady: true, loadProgress: 1 });
+          console.log(`[FrameDecoder] ${bitmaps.length} frames ready`);
         }
       } catch (err) {
-        console.error('[FrameDecoder]', err);
-        if (!cancelled) setState(s => ({ ...s, supported: false }));
+        console.error('[FrameDecoder] failed:', err);
+        // Silently fall back to animated <img>
       }
     }
 
@@ -205,19 +209,22 @@ function ScrollHero() {
   const rafRef     = useRef<number>(0);
   const [progress, setProgress] = useState(0);
 
-  const { frames, loaded, supported, loadProgress } = useFrameDecoder(WEBP_URL);
+  const { frames, scrubReady, loadProgress } = useFrameDecoder(WEBP_URL);
 
   // Keep canvas pixel dimensions in sync with viewport
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    const resize = () => {
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+    };
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
   }, []);
 
-  // Single RAF loop: read scroll → pick frame → draw → update state
+  // RAF loop: read scroll → update progress → draw frame to canvas
   const startLoop = useCallback(() => {
     let lastIdx = -1;
 
@@ -226,16 +233,16 @@ function ScrollHero() {
       const canvas  = canvasRef.current;
 
       if (section) {
-        const rect       = section.getBoundingClientRect();
+        const rect        = section.getBoundingClientRect();
         const totalScroll = section.offsetHeight - window.innerHeight;
-        const p          = clamp(-rect.top / totalScroll, 0, 1);
+        const p           = clamp(-rect.top / totalScroll, 0, 1);
 
         setProgress(p);
 
-        if (canvas && loaded && frames.length > 0) {
+        // Draw the target frame only when scrubbing is ready
+        if (canvas && scrubReady && frames.length > 0) {
           const ctx = canvas.getContext('2d');
           const idx = clamp(Math.round(p * (frames.length - 1)), 0, frames.length - 1);
-
           if (ctx && idx !== lastIdx) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             drawFrameCover(ctx, frames[idx], canvas.width, canvas.height);
@@ -249,11 +256,11 @@ function ScrollHero() {
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [frames, loaded]);
+  }, [frames, scrubReady]);
 
   useEffect(() => startLoop(), [startLoop]);
 
-  // Text reveal values derived from scroll progress
+  // Text reveal values
   const introOpacity = mapRange(progress, 0,    0.18, 1, 0);
   const introY       = mapRange(progress, 0,    0.22, 0, -50);
   const titleOpacity = mapRange(progress, 0.3,  0.52, 0, 1);
@@ -262,36 +269,49 @@ function ScrollHero() {
   const subY         = mapRange(progress, 0.45, 0.65, 30, 0);
   const ctaOpacity   = mapRange(progress, 0.6,  0.80, 0, 1);
   const ctaY         = mapRange(progress, 0.6,  0.80, 20, 0);
-  const overlayOp    = mapRange(progress, 0.25, 0.7,  0, 0.58);
+  const overlayOp    = mapRange(progress, 0.25, 0.7,  0, 0.55);
   const hintOp       = mapRange(progress, 0,    0.10, 1, 0);
 
+  // Scroll-driven scale for the img fallback (CSS zoom, always feels alive)
+  const imgScale = scrubReady ? 1 : mapRange(progress, 0, 1, 1, 1.35);
+
   return (
-    // 320vh outer container — provides scroll distance
     <div ref={sectionRef} style={{ height: '320vh' }}>
-      {/* Viewport-locked sticky panel */}
       <div className="sticky top-0 h-screen overflow-hidden bg-black">
 
-        {/* ── Scrubbed canvas ── */}
-        {supported ? (
-          <canvas
-            ref={canvasRef}
-            className="absolute inset-0 w-full h-full"
-            style={{ display: loaded ? 'block' : 'none' }}
-          />
-        ) : (
-          <img src={WEBP_URL} alt="" className="absolute inset-0 w-full h-full object-cover" />
-        )}
+        {/* ── Layer 1: animated WebP — ALWAYS visible as base ── */}
+        {/* Provides immediate visual even before frame decode completes.      */}
+        {/* When scrubReady, it's hidden under the canvas (opacity:0).        */}
+        <img
+          src={WEBP_URL}
+          alt=""
+          className="absolute inset-0 w-full h-full object-cover origin-center"
+          style={{
+            transform: `scale(${imgScale})`,
+            opacity: scrubReady ? 0 : 1,
+            transition: 'opacity 0.4s ease',
+            willChange: 'transform, opacity',
+          }}
+        />
 
-        {/* Loading bar */}
-        {!loaded && supported && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-5">
-            <div className="w-48 h-px bg-white/10 overflow-hidden">
-              <div
-                className="h-full bg-[#34d5b0] transition-all duration-200"
-                style={{ width: `${loadProgress * 100}%` }}
-              />
-            </div>
-            <p className="text-white/30 text-[10px] tracking-[0.3em] uppercase">Loading</p>
+        {/* ── Layer 2: canvas for scroll-scrubbed frames ── */}
+        {/* Shown on top once ImageDecoder has all frames ready.               */}
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full"
+          style={{
+            opacity: scrubReady ? 1 : 0,
+            transition: 'opacity 0.4s ease',
+          }}
+        />
+
+        {/* Thin loading bar — only visible while decoding (img already shows) */}
+        {!scrubReady && loadProgress > 0 && loadProgress < 1 && (
+          <div className="absolute bottom-0 left-0 right-0 h-px bg-white/8">
+            <div
+              className="h-full bg-[#34d5b0] transition-all duration-150"
+              style={{ width: `${loadProgress * 100}%` }}
+            />
           </div>
         )}
 
@@ -326,9 +346,7 @@ function ScrollHero() {
 
         {/* ── Reveal text (fades in) ── */}
         <div className="absolute inset-0 flex flex-col items-start justify-end px-8 sm:px-14 md:px-20 pb-20">
-          <div
-            style={{ opacity: titleOpacity, transform: `translateY(${titleY}px)`, willChange: 'opacity, transform' }}
-          >
+          <div style={{ opacity: titleOpacity, transform: `translateY(${titleY}px)`, willChange: 'opacity, transform' }}>
             <p className="text-xs sm:text-sm font-semibold tracking-[0.28em] uppercase text-[#34d5b0] mb-4">
               Protein Engineering
             </p>
@@ -369,10 +387,10 @@ function ScrollHero() {
           <ArrowDown size={14} className="text-white/35 animate-bounce" />
         </div>
 
-        {/* Frame indicator (subtle) */}
-        {loaded && frames.length > 0 && (
+        {/* Frame scrub indicator */}
+        {scrubReady && frames.length > 0 && (
           <div className="absolute top-20 right-5 text-white/15 text-[10px] font-mono pointer-events-none tabular-nums select-none">
-            {clamp(Math.round(progress * (frames.length - 1)), 0, frames.length - 1) + 1} / {frames.length}
+            {clamp(Math.round(progress * (frames.length - 1)), 0, frames.length - 1) + 1}/{frames.length}
           </div>
         )}
       </div>
